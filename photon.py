@@ -149,13 +149,18 @@ files = set()  # The pdf, css, png, etc files.
 intel = set()  # The email addresses, website accounts, AWS buckets etc.
 robots = set()  # The entries of robots.txt
 custom = set()  # Strings extracted by custom regex pattern
-failed = set()  # URLs that photon failed to crawl
+failed = set()  # URLs that photon could not crawl (restricted or exhausted)
 scripts = set()  # THe Javascript files
 external = set()  # URLs that don't belong to the target i.e. out-of-scope
 # URLs that have get params in them e.g. example.com/page.php?id=2
 fuzzable = set()
 endpoints = set()  # URLs found from javascript files
-processed = set(['dummy'])  # URLs that have been crawled
+processed = set(['dummy'])  # URLs that have been crawled successfully
+# URLs currently in a temporary failure state, retryable within this run
+transient = set()
+# Per-URL fetch attempt counter, shared across levels so the retry budget
+# survives re-queues and duplicate submissions
+attempts = {}
 # URLs that belong to the target i.e. in-scope
 internal = set(args.seeds)
 
@@ -238,7 +243,14 @@ def remove_file(url):
 
 def extractor(url):
     """Extract details from the response body."""
-    response = requester(url, main_url, delay, cook, headers, timeout, host, proxies, user_agents, failed, processed)
+    result = requester(url, main_url, delay, cook, headers, timeout, host,
+                       proxies, user_agents, failed, processed, transient,
+                       attempts)
+    # Only successfully parsed responses are analyzed or mirrored; restricted
+    # or exhausted URLs carry the 'dummy' sentinel
+    if not result.ok:
+        return
+    response = result.body
     if clone:
         mirror(url, response)
     matches = rhref.findall(response)
@@ -289,7 +301,12 @@ def extractor(url):
 
 def jscanner(url):
     """Extract endpoints from JavaScript code."""
-    response = requester(url, main_url, delay, cook, headers, timeout, host, proxies, user_agents, failed, processed)
+    result = requester(url, main_url, delay, cook, headers, timeout, host,
+                       proxies, user_agents, failed, processed, transient,
+                       attempts)
+    if not result.ok:
+        return
+    response = result.body
     # Extract URLs/endpoints
     matches = rendpoint.findall(response)
     # Iterate over the matches, match is a tuple
@@ -313,15 +330,16 @@ internal = set(remove_regex(internal, args.exclude))
 
 # Step 2. Crawl recursively to the limit specified in "crawl_level"
 for level in range(crawl_level):
-    # Links to crawl = (all links - already crawled links) - links not to crawl
-    links = remove_regex(internal - processed, args.exclude)
-    # If links to crawl are 0 i.e. all links have been crawled
+    # Links to crawl = (all links - already crawled links) - links not to crawl.
+    # Only successfully parsed URLs enter `processed`, so a URL that hit a
+    # temporary failure stays in this queue until its retry budget lets a
+    # later attempt (within the same run) succeed. Restricted URLs are kept
+    # in `failed` so they don't keep the queue artificially alive.
+    links = set(remove_regex(
+        internal - processed - failed, args.exclude))
+    # Nothing left that could still be fetched
     if not links:
         break
-    # if crawled links are somehow more than all links. Possible? ;/
-    elif len(internal) <= len(processed):
-        if len(internal) > 2 + len(args.seeds):
-            break
     print('%s Level %i: %i URLs' % (run, level + 1, len(links)))
     try:
         flash(extractor, links, thread_count)
@@ -371,7 +389,9 @@ if not only_urls:
 now = time.time()
 # Finds total time taken
 diff = (now - then)
-minutes, seconds, time_per_request = timer(diff, processed)
+# Every fetch attempt counts, including retries of temporary failures
+total_requests = sum(attempts.values())
+minutes, seconds, time_per_request = timer(diff, total_requests)
 
 # Step 4. Save the results
 if not os.path.exists(output_dir): # if the directory doesn't exist
@@ -390,9 +410,9 @@ for dataset, dataset_name in zip(datasets, dataset_names):
         print('%s %s: %s' % (good, dataset_name.capitalize(), len(dataset)))
 print(('%s-%s' % (red, end)) * 50)
 
-print('%s Total requests made: %i' % (info, len(processed)))
+print('%s Total requests made: %i' % (info, total_requests))
 print('%s Total time taken: %i minutes %i seconds' % (info, minutes, seconds))
-print('%s Requests per second: %i' % (info, int(len(processed) / diff)))
+print('%s Requests per second: %i' % (info, int(total_requests / diff)))
 
 datasets = {
     'files': list(files), 'intel': list(intel), 'robots': list(robots),

@@ -1,8 +1,10 @@
 import requests
 import math
+import os
 import os.path
 import re
 import argparse
+import tempfile
 
 import tld
 
@@ -75,24 +77,60 @@ def remove_regex(urls, regex):
     return non_matching_urls
 
 
+def atomic_write(filepath, data, binary=False):
+    """Write ``data`` to ``filepath`` atomically.
+
+    The content goes into a unique temporary file in the same directory and
+    is published with os.replace, so readers never observe a half-written
+    file and an interrupted run cannot corrupt or truncate the previous
+    result. Each dataset uses its own filepath, therefore distinct
+    collections can never overwrite each other.
+    """
+    directory = os.path.dirname(filepath) or '.'
+    mode = 'wb' if binary else 'w'
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode=mode,
+                dir=directory,
+                prefix=('.' + os.path.basename(filepath) + '.'),
+                suffix='.tmp',
+                delete=False,
+                encoding=None if binary else 'utf-8',
+                newline='') as tmp:
+            tmp_path = tmp.name
+            tmp.write(data)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_path, filepath)
+    except BaseException:
+        # Never leave temp files behind on failure
+        if tmp is not None and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
 def writer(datasets, dataset_names, output_dir):
-    """Write the results."""
+    """Write the results, one distinct file per dataset, atomically."""
     for dataset, dataset_name in zip(datasets, dataset_names):
         if dataset:
             filepath = output_dir + '/' + dataset_name + '.txt'
-            with open(filepath, 'w+') as out_file:
-                joined = '\n'.join(dataset)
-                out_file.write(str(joined.encode('utf-8').decode('utf-8')))
-                out_file.write('\n')
+            joined = '\n'.join(str(item) for item in dataset)
+            atomic_write(filepath, joined + '\n')
 
 
 def timer(diff, processed):
-    """Return the passed time."""
+    """Return the passed time.
+
+    ``processed`` is either the number of requests made or a sized
+    collection whose length is used.
+    """
     # Changes seconds into minutes and seconds
     minutes, seconds = divmod(diff, 60)
+    request_count = processed if isinstance(processed, int) else len(processed)
     try:
         # Finds average time taken by requests
-        time_per_request = diff / float(len(processed))
+        time_per_request = diff / float(request_count)
     except ZeroDivisionError:
         time_per_request = 0
     return minutes, seconds, time_per_request
